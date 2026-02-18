@@ -9,6 +9,10 @@
     {
       "path": "/api/cron/check-expiry",
       "schedule": "0 0 * * *"
+    },
+    {
+      "path": "/api/stepmail/send/process",
+      "schedule": "*/5 * * * *"
     }
   ]
 }
