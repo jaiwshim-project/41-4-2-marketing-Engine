@@ -30,6 +30,7 @@ const mainNav = [
 ];
 
 const subNav = [
+  { href: '/stepmail', label: '스텝메일' },
   { href: '/pricing', label: '요금제' },
   { href: '/resources', label: '자료실' },
   { href: '/community', label: '질문/후기' },

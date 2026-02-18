@@ -1,8 +1,31 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import type { FunnelStage, EmotionType } from '@/lib/stepmail/types';
+
+interface HistoryListItem {
+  id: string;
+  type: 'analysis' | 'generation';
+  title: string;
+  summary: string;
+  date: string;
+  category: string;
+  target_keyword: string;
+  preview: string;
+  already_imported: boolean;
+}
+
+const CATEGORY_LABELS: Record<string, string> = {
+  blog: '블로그',
+  product: '제품',
+  faq: 'FAQ',
+  howto: '하우투',
+  landing: '랜딩',
+  technical: '기술',
+  social: '소셜',
+  email: '이메일',
+};
 
 export default function NewContentPage() {
   const router = useRouter();
@@ -16,10 +39,31 @@ export default function NewContentPage() {
   });
   const [saving, setSaving] = useState(false);
 
-  // geo-aio 히스토리 임포트 모달
+  // GEOAIO 임포트 모달
   const [showImport, setShowImport] = useState(false);
-  const [historyId, setHistoryId] = useState('');
+  const [historyItems, setHistoryItems] = useState<HistoryListItem[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyType, setHistoryType] = useState('');
+  const [historySearch, setHistorySearch] = useState('');
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+
+  const fetchHistory = useCallback(async () => {
+    setHistoryLoading(true);
+    const params = new URLSearchParams();
+    if (historyType) params.set('type', historyType);
+    if (historySearch) params.set('search', historySearch);
+    const res = await fetch(`/api/stepmail/contents/history-list?${params}`);
+    const data = await res.json();
+    setHistoryItems(data.items || []);
+    setHistoryLoading(false);
+  }, [historyType, historySearch]);
+
+  useEffect(() => {
+    if (showImport) {
+      fetchHistory();
+    }
+  }, [showImport, fetchHistory]);
 
   const handleSave = async () => {
     if (!form.title || !form.subject_line) {
@@ -42,9 +86,9 @@ export default function NewContentPage() {
     setSaving(false);
   };
 
-  const handleImport = async () => {
-    if (!historyId) return;
+  const handleImport = async (historyId: string) => {
     setImporting(true);
+    setSelectedId(historyId);
     const res = await fetch('/api/stepmail/contents/import-from-history', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -57,6 +101,7 @@ export default function NewContentPage() {
       alert(err.error || '임포트 실패');
     }
     setImporting(false);
+    setSelectedId(null);
   };
 
   return (
@@ -65,7 +110,7 @@ export default function NewContentPage() {
         <h1 className="text-xl font-bold text-gray-900">새 콘텐츠 만들기</h1>
         <button
           onClick={() => setShowImport(true)}
-          className="px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50"
+          className="px-4 py-2 bg-indigo-50 border border-indigo-200 rounded-lg text-sm font-medium text-indigo-700 hover:bg-indigo-100 transition-colors"
         >
           GEOAIO에서 가져오기
         </button>
@@ -163,33 +208,133 @@ export default function NewContentPage() {
         </div>
       </div>
 
-      {/* GEOAIO 임포트 모달 */}
+      {/* GEOAIO 콘텐츠 목록 임포트 모달 */}
       {showImport && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-xl p-6 w-full max-w-md">
-            <h3 className="text-lg font-semibold mb-4">GEOAIO 콘텐츠 가져오기</h3>
-            <p className="text-sm text-gray-500 mb-4">
-              GEOAIO 대시보드에서 생성한 콘텐츠의 ID를 입력하면 자동으로 가져오고 AI 분류를 적용합니다.
-            </p>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">히스토리 ID</label>
-              <input
-                type="text"
-                value={historyId}
-                onChange={(e) => setHistoryId(e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg text-sm"
-                placeholder="GEOAIO 대시보드의 콘텐츠 ID"
-              />
+          <div className="bg-white rounded-xl w-full max-w-3xl max-h-[85vh] flex flex-col">
+            {/* 모달 헤더 */}
+            <div className="px-6 py-4 border-b">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900">GEOAIO 콘텐츠 가져오기</h3>
+                  <p className="text-sm text-gray-500 mt-0.5">생성된 콘텐츠를 선택하면 AI 분류와 함께 자동으로 가져옵니다</p>
+                </div>
+                <button onClick={() => setShowImport(false)} className="text-gray-400 hover:text-gray-600 text-xl">&times;</button>
+              </div>
+
+              {/* 필터 */}
+              <div className="flex gap-2 mt-3">
+                <select
+                  value={historyType}
+                  onChange={(e) => setHistoryType(e.target.value)}
+                  className="px-3 py-1.5 border rounded-lg text-sm"
+                >
+                  <option value="">전체 유형</option>
+                  <option value="generation">생성</option>
+                  <option value="analysis">분석</option>
+                </select>
+                <input
+                  type="text"
+                  value={historySearch}
+                  onChange={(e) => setHistorySearch(e.target.value)}
+                  placeholder="제목 또는 키워드 검색..."
+                  className="flex-1 px-3 py-1.5 border rounded-lg text-sm"
+                  onKeyDown={(e) => { if (e.key === 'Enter') fetchHistory(); }}
+                />
+                <button
+                  onClick={fetchHistory}
+                  className="px-3 py-1.5 bg-gray-100 border rounded-lg text-sm hover:bg-gray-200"
+                >
+                  검색
+                </button>
+              </div>
             </div>
-            <div className="flex justify-end gap-2 mt-6">
-              <button onClick={() => setShowImport(false)} className="px-4 py-2 border rounded-lg text-sm">취소</button>
-              <button
-                onClick={handleImport}
-                disabled={importing}
-                className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700 disabled:opacity-50"
-              >
-                {importing ? '가져오는 중...' : '가져오기 + AI 분류'}
-              </button>
+
+            {/* 콘텐츠 목록 */}
+            <div className="flex-1 overflow-auto px-6 py-3">
+              {historyLoading ? (
+                <div className="text-center py-12 text-gray-500">콘텐츠 목록을 불러오는 중...</div>
+              ) : historyItems.length === 0 ? (
+                <div className="text-center py-12">
+                  <p className="text-gray-500">GEOAIO에서 생성한 콘텐츠가 없습니다</p>
+                  <p className="text-sm text-gray-400 mt-1">먼저 GEOAIO에서 콘텐츠를 생성해주세요</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {historyItems.map(item => (
+                    <div
+                      key={item.id}
+                      className={`border rounded-lg p-4 transition-all ${
+                        item.already_imported
+                          ? 'bg-gray-50 border-gray-200 opacity-60'
+                          : 'hover:border-indigo-300 hover:shadow-sm cursor-pointer'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                              item.type === 'generation'
+                                ? 'bg-blue-100 text-blue-700'
+                                : 'bg-green-100 text-green-700'
+                            }`}>
+                              {item.type === 'generation' ? '생성' : '분석'}
+                            </span>
+                            {item.category && (
+                              <span className="text-[10px] text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded">
+                                {CATEGORY_LABELS[item.category] || item.category}
+                              </span>
+                            )}
+                            {item.target_keyword && (
+                              <span className="text-[10px] text-indigo-500">#{item.target_keyword}</span>
+                            )}
+                            {item.already_imported && (
+                              <span className="text-[10px] text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded font-medium">이미 가져옴</span>
+                            )}
+                          </div>
+                          <h4 className="text-sm font-semibold text-gray-900 truncate">{item.title}</h4>
+                          {item.preview && (
+                            <p className="text-xs text-gray-500 mt-1 line-clamp-2">{item.preview}</p>
+                          )}
+                          <p className="text-[10px] text-gray-400 mt-1.5">{item.date}</p>
+                        </div>
+                        <button
+                          onClick={() => handleImport(item.id)}
+                          disabled={importing || item.already_imported}
+                          className={`shrink-0 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                            item.already_imported
+                              ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                              : importing && selectedId === item.id
+                              ? 'bg-indigo-200 text-indigo-600'
+                              : 'bg-indigo-600 text-white hover:bg-indigo-700'
+                          }`}
+                        >
+                          {importing && selectedId === item.id
+                            ? 'AI 분류 중...'
+                            : item.already_imported
+                            ? '가져옴'
+                            : '가져오기'}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* 모달 푸터 */}
+            <div className="px-6 py-3 border-t bg-gray-50 rounded-b-xl">
+              <div className="flex items-center justify-between">
+                <p className="text-xs text-gray-400">
+                  {historyItems.length}개의 콘텐츠 (최대 50개 표시)
+                </p>
+                <button
+                  onClick={() => setShowImport(false)}
+                  className="px-4 py-1.5 border rounded-lg text-sm hover:bg-gray-100"
+                >
+                  닫기
+                </button>
+              </div>
             </div>
           </div>
         </div>
