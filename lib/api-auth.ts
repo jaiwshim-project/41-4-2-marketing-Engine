@@ -30,12 +30,25 @@ export function getGeminiKey(request: NextRequest, body?: Record<string, unknown
 }
 
 /**
+ * Extract Claude API key from request.
+ * Priority: X-Claude-Key header > process.env.CLAUDE_API_KEY
+ */
+export function getClaudeKey(request: NextRequest): string | undefined {
+  const headerKey = request.headers.get('X-Claude-Key');
+  if (headerKey) return headerKey;
+
+  return process.env.CLAUDE_API_KEY;
+}
+
+/**
  * Allowed origins for CORS.
  */
 const ALLOWED_ORIGINS = [
   'https://aio-geo-optimizer.vercel.app',
   'https://ai-optimized-contents.vercel.app',
   'https://41-4-ai-optimized-contents.vercel.app',
+  'https://www.geo-aio.com',
+  'https://geo-aio.com',
   process.env.NEXT_PUBLIC_SITE_URL,
 ].filter(Boolean) as string[];
 
@@ -53,7 +66,7 @@ function getAllowedOrigin(request?: NextRequest): string {
 export function withCors(response: NextResponse, request?: NextRequest): NextResponse {
   response.headers.set('Access-Control-Allow-Origin', getAllowedOrigin(request));
   response.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  response.headers.set('Access-Control-Allow-Headers', 'Content-Type, X-API-Key, X-Gemini-Key, Authorization');
+  response.headers.set('Access-Control-Allow-Headers', 'Content-Type, X-API-Key, X-Gemini-Key, X-Claude-Key, X-API-Provider, Authorization');
   response.headers.set('Vary', 'Origin');
   return response;
 }
