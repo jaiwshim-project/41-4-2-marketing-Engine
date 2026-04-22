@@ -4,12 +4,14 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import Header from '@/components/Header';
+import CategoryBanner from '@/components/CategoryBanner';
 import Footer from '@/components/Footer';
 import ApiKeyPanel from '@/components/ApiKeyPanel';
 import type { ContentCategory } from '@/lib/types';
 import { saveHistoryItem, generateId } from '@/lib/history';
-import { getProfiles, saveProfile, deleteProfile as deleteProfileSupabase, type Profile, type ProfileData } from '@/lib/supabase-storage';
-import { canUseFeature, incrementUsage } from '@/lib/usage';
+import { getProfiles, saveProfile, deleteProfile as deleteProfileSupabase, saveApiKey, type Profile, type ProfileData } from '@/lib/supabase-storage';
+// canUseFeature, incrementUsage는 커스텀 사용자 시스템에서 API 방식으로 대체
+import { useUser } from '@/lib/user-context';
 
 const categories: { id: ContentCategory; label: string; description: string; icon: string; color: string; bgIdle: string }[] = [
   {
@@ -78,17 +80,38 @@ const categories: { id: ContentCategory; label: string; description: string; ico
   },
 ];
 
+// ==================== 카테고리별 서브키워드 ====================
+const subKeywordsByCategory: Record<ContentCategory, string[]> = {
+  blog: ['일반 블로그', '뷰티', '푸드', '여행', '라이프스타일', '기술', '금융', '건강'],
+  product: ['의료 제품', '화장품', '패션', '전자제품', '식품', '가구', '서비스'],
+  faq: ['일반 FAQ', '기술 지원', '고객 서비스', '제품 사용법', '결제/배송', '회원 관리'],
+  howto: ['일상 가이드', '요리 레시피', 'DIY', '기술 튜토리얼', '운동/피트니스', '학습'],
+  landing: ['SaaS', 'E-commerce', '서비스', '구독형', '모바일 앱', '교육'],
+  technical: ['API 문서', '시스템 설계', '개발 가이드', '운영 매뉴얼', '보안 가이드'],
+  social: ['인스타그램', '페이스북', '유튜브', '틱톡', '링크드인', '트위터'],
+  email: ['뉴스레터', '프로모션', '고객 유지', '이벤트 안내', '제품 소개'],
+};
+
 const toneOptions = [
   { value: '전문적이고 신뢰감 있는', label: '전문적' },
   { value: '친근하고 대화체의', label: '친근한' },
   { value: '설득력 있고 강렬한', label: '설득적' },
   { value: '간결하고 명확한', label: '간결한' },
   { value: '스토리텔링 중심의', label: '스토리텔링' },
+  { value: '뉴스/저널리즘 스타일의', label: '뉴스형' },
+  { value: '교육적이고 강의형의', label: '교육형' },
+  { value: '비교분석 중심의', label: '비교분석형' },
+  { value: '사례연구 중심의', label: '사례연구형' },
+  { value: '감성적이고 공감하는', label: '감성형' },
 ];
 
 export default function GeneratePage() {
   const router = useRouter();
+  const { selectedProject, geminiApiKey: contextApiKey, setGeminiApiKey: setContextApiKey, currentUser } = useUser();
+  // context 로드 전 빈값일 경우 localStorage에서 직접 읽어 fallback
+  const geminiApiKey = contextApiKey || (typeof window !== 'undefined' ? localStorage.getItem('geoaio_gemini_key') || '' : '');
   const [selectedCategory, setSelectedCategory] = useState<ContentCategory | null>(null);
+  const [selectedSubKeyword, setSelectedSubKeyword] = useState<string>('');
   const [topic, setTopic] = useState('');
   const [targetKeyword, setTargetKeyword] = useState('');
   const [tone, setTone] = useState('전문적이고 신뢰감 있는');
@@ -96,6 +119,18 @@ export default function GeneratePage() {
   const [referenceFiles, setReferenceFiles] = useState<{ name: string; content: string }[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showKeyRecovery, setShowKeyRecovery] = useState(false);
+  const [recoveryKey, setRecoveryKey] = useState('');
+  const [recoveryKeyVisible, setRecoveryKeyVisible] = useState(false);
+  const [recoverySaving, setRecoverySaving] = useState(false);
+  const [recoverySaved, setRecoverySaved] = useState(false);
+
+  // 하단 상시 API 키 패널
+  const [inlineKey, setInlineKey] = useState('');
+  const [inlineKeyVisible, setInlineKeyVisible] = useState(false);
+  const [inlineSaving, setInlineSaving] = useState(false);
+  const [inlineHasKey, setInlineHasKey] = useState(false);
+  const [inlineStatus, setInlineStatus] = useState<{ type: 'success' | 'error'; msg: string } | null>(null);
   const [abTestMode, setAbTestMode] = useState(false);
   const [showApiKeyInput, setShowApiKeyInput] = useState(false);
   const [showBusinessInfo, setShowBusinessInfo] = useState(false);
@@ -123,10 +158,279 @@ export default function GeneratePage() {
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const profileListRef = useRef<HTMLDivElement>(null);
 
-  // Supabase에서 프로필 목록 로드
+  // ==================== API 자동 선택 ====================
+  const [availableApis, setAvailableApis] = useState<string[]>([]);
+  const [selectedApi, setSelectedApi] = useState<'gemini' | 'claude' | 'geo-aio'>('claude');
+
+  // ==================== 동적 분야 생성 ====================
+  const [dynamicSubKeywords, setDynamicSubKeywords] = useState<string[]>([]);
+  const [loadingSubKeywords, setLoadingSubKeywords] = useState(false);
+
+  // API 가용성 확인 (페이지 로드 시)
+  useEffect(() => {
+    const checkApis = async () => {
+      const available: string[] = [];
+
+      // Gemini 확인
+      const geminiKey = contextApiKey || (typeof window !== 'undefined' ? localStorage.getItem('geoaio_gemini_key') : '') || '';
+      if (geminiKey) available.push('gemini');
+
+      // Claude 확인
+      if (typeof window !== 'undefined') {
+        const claudeKey = localStorage.getItem('ai_claude_key') || '';
+        if (claudeKey) available.push('claude');
+      }
+
+      // 서버 환경변수 확인 (Vercel)
+      try {
+        const res = await fetch('/api/ai-status');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.availableModels) {
+            if (data.availableModels.includes('🧠 Claude')) available.push('claude');
+          }
+        }
+      } catch {}
+
+      setAvailableApis(available);
+      if (available.length > 0) {
+        // 우선순위: Claude > Gemini > Geo-AIO (Claude를 디폴트로)
+        if (available.includes('claude')) setSelectedApi('claude');
+        else if (available.includes('gemini')) setSelectedApi('gemini');
+      }
+    };
+
+    checkApis();
+  }, [contextApiKey]);
+
+  // 주제 추천 드롭다운
+  const [topicSuggestions, setTopicSuggestions] = useState<string[]>([]);
+  const [loadingTopics, setLoadingTopics] = useState(false);
+  const [topicFetchError, setTopicFetchError] = useState('');
+  const [showTopicDropdown, setShowTopicDropdown] = useState(false);
+  // 키워드 추천
+  const [keywordSuggestions, setKeywordSuggestions] = useState<string[]>([]);
+  const [selectedKeywords, setSelectedKeywords] = useState<string[]>([]);
+  const [loadingKeywords, setLoadingKeywords] = useState(false);
+  // 타겟 키워드 입력 (초기값은 빈 문자열)
+  const [customKeyword, setCustomKeyword] = useState('');
+
+  // 프로필 목록 로드
   useEffect(() => {
     getProfiles().then(profiles => setSavedProfiles(profiles));
   }, []);
+
+
+  // 카테고리 변경 시 이전 추천 초기화
+  useEffect(() => {
+    setTopicSuggestions([]);
+    setTopicFetchError('');
+    setShowTopicDropdown(false);
+    setSelectedSubKeyword('');
+  }, [selectedCategory]);
+
+  // 동적 분야 로드 (카테고리 또는 프로젝트 변경 시)
+  useEffect(() => {
+    setDynamicSubKeywords([]);
+
+    if (selectedCategory && selectedProject?.name) {
+      console.log('[분야] useEffect 트리거:', {
+        category: selectedCategory,
+        projectName: selectedProject.name
+      });
+      loadDynamicSubKeywords(selectedCategory);
+    }
+  }, [selectedCategory, selectedProject?.name]);
+
+  // 동적 분야 생성 (프로젝트 중심 + 비즈니스 정보 보조)
+  const loadDynamicSubKeywords = async (category: ContentCategory) => {
+    if (!selectedProject?.name) {
+      console.log('[분야] 프로젝트 정보 없음');
+      return;
+    }
+
+    setLoadingSubKeywords(true);
+    console.log('[분야] 로드 시작:', { projectName: selectedProject.name, category });
+
+    try {
+      const headers = getApiHeaders(selectedApi);
+      const payload = {
+        category,
+        projectName: selectedProject.name,
+        projectDescription: selectedProject.description || '',
+        projectFiles: [], // files는 선택사항이므로 제외
+        businessInfo: businessInfo ? {
+          industry: businessInfo.industry || businessInfo.customIndustry || '',
+          mainProduct: businessInfo.mainProduct || '',
+          mainBenefit: businessInfo.mainBenefit || '',
+          targetAudience: businessInfo.targetAudience || '',
+        } : {},
+      };
+
+      console.log('[분야] 요청 페이로드:', payload);
+      console.log('[분야] 요청 헤더:', { ...headers, 'X-API-Provider': selectedApi });
+
+      const res = await fetch('/api/suggest-subkeywords', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...headers,
+          'X-API-Provider': selectedApi,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      console.log('[분야] 응답 상태:', res.status, res.statusText);
+
+      if (res.ok) {
+        const data = await res.json();
+        console.log('[분야] 응답 데이터:', data);
+        setDynamicSubKeywords(data.subKeywords || []);
+      } else {
+        const errorText = await res.text();
+        console.error('[분야] API 에러:', res.status, errorText);
+        setDynamicSubKeywords([]);
+      }
+    } catch (e) {
+      console.error('[분야] 예외 발생:', e);
+      setDynamicSubKeywords([]);
+    } finally {
+      setLoadingSubKeywords(false);
+    }
+  };
+
+  // ==================== AI별 헤더 생성 ====================
+  const getApiHeaders = (api: string): Record<string, string> => {
+    if (api === 'gemini') {
+      return { 'X-Gemini-Key': contextApiKey || (typeof window !== 'undefined' ? localStorage.getItem('geoaio_gemini_key') || '' : '') };
+    } else if (api === 'claude') {
+      return { 'X-Claude-Key': typeof window !== 'undefined' ? localStorage.getItem('ai_claude_key') || '' : '' };
+    }
+    return {};
+  };
+
+  // 주제 추천 fetch (버튼 클릭 시 호출)
+  const fetchTopicSuggestions = async (cat: string, inputTopic?: string) => {
+    if (loadingTopics) return;
+    setLoadingTopics(true);
+    setTopicSuggestions([]);
+    setTopicFetchError('');
+
+    // selectedProject가 null일 경우 sessionStorage에서 직접 읽기
+    let activeProject = selectedProject;
+    if (!activeProject) {
+      try {
+        const stored = sessionStorage.getItem('geoaio_project');
+        if (stored) activeProject = JSON.parse(stored);
+      } catch {}
+    }
+
+    // 이전 작성 주제 + 프로젝트 파일 병렬 조회
+    let pastTopics: string[] = [];
+    let projectFiles: { file_name: string; content: string }[] = [];
+    if (activeProject?.id) {
+      try {
+        const [historyRes, filesRes] = await Promise.all([
+          fetch(`/api/generate-results?project_id=${activeProject.id}`),
+          fetch(`/api/user-projects/files?project_id=${activeProject.id}`),
+        ]);
+        const historyData = await historyRes.json();
+        const filesData = await filesRes.json();
+        pastTopics = (historyData.items || []).map((item: { topic: string }) => item.topic).filter(Boolean);
+        projectFiles = (filesData.files || []).filter((f: { content: string }) => f.content);
+      } catch {}
+    }
+
+    const catLabel = categories.find(c => c.id === cat)?.label || cat;
+    try {
+      const res = await fetch('/api/suggest-topics', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getApiHeaders(selectedApi),
+          'X-API-Provider': selectedApi,
+        },
+        body: JSON.stringify({
+          category: cat,
+          categoryLabel: catLabel,
+          pastTopics,
+          projectName: activeProject?.name,
+          projectDescription: activeProject?.description,
+          projectFiles,
+          inputTopic: inputTopic || '',
+          subKeyword: selectedSubKeyword || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setTopicFetchError(data.error || `오류 (${res.status})`);
+      } else {
+        setTopicSuggestions(data.topics || []);
+        if (!data.topics?.length) setTopicFetchError('추천 주제를 가져오지 못했습니다.');
+      }
+    } catch (e) {
+      setTopicFetchError(e instanceof Error ? e.message : '네트워크 오류');
+    }
+    setLoadingTopics(false);
+  };
+
+  // 주제 선택/변경 시 키워드 추천 + 자동 선택
+  const fetchKeywordSuggestions = async (topicValue: string) => {
+    if (!topicValue.trim() || !selectedCategory) return;
+    setLoadingKeywords(true);
+    setKeywordSuggestions([]);
+    setSelectedKeywords([]);
+    const catLabel = categories.find(c => c.id === selectedCategory)?.label || selectedCategory;
+    try {
+      const res = await fetch('/api/suggest-keywords', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getApiHeaders(selectedApi),
+          'X-API-Provider': selectedApi,
+        },
+        body: JSON.stringify({ topic: topicValue, category: selectedCategory, categoryLabel: catLabel }),
+      });
+      const data = await res.json();
+      const keywords = data.keywords || [];
+      setKeywordSuggestions(keywords);
+
+      // 자동으로 상위 2-3개 키워드 선택
+      if (keywords.length > 0) {
+        const autoSelectedCount = Math.min(3, keywords.length); // 최대 3개
+        const autoSelected = keywords.slice(0, autoSelectedCount);
+        setSelectedKeywords(autoSelected);
+        setTargetKeyword(autoSelected.join(', '));
+      }
+    } catch {}
+    setLoadingKeywords(false);
+  };
+
+  const handleTopicSuggestionClick = (suggestion: string) => {
+    setTopic(suggestion);
+    setShowTopicDropdown(false);
+    fetchKeywordSuggestions(suggestion);
+  };
+
+  const toggleKeyword = (kw: string) => {
+    setSelectedKeywords(prev => {
+      const next = prev.includes(kw) ? prev.filter(k => k !== kw) : [...prev, kw];
+      setTargetKeyword(next.join(', '));
+      return next;
+    });
+  };
+
+  const addCustomKeyword = () => {
+    const kw = customKeyword.trim();
+    if (!kw) return;
+    setSelectedKeywords(prev => {
+      if (prev.includes(kw)) return prev;
+      const next = [...prev, kw];
+      setTargetKeyword(next.join(', '));
+      return next;
+    });
+    setCustomKeyword('');
+  };
 
   // 프로필 목록 외부 클릭 시 닫기
   useEffect(() => {
@@ -346,118 +650,218 @@ export default function GeneratePage() {
 
   const handleGenerate = async () => {
     if (!selectedCategory || !topic.trim()) return;
+
+    // ==================== API 자동 선택 로직 ====================
+    const getApiKey = (api: string): string => {
+      if (api === 'gemini') {
+        return contextApiKey || (typeof window !== 'undefined' ? localStorage.getItem('geoaio_gemini_key') || '' : '');
+      } else if (api === 'claude') {
+        return typeof window !== 'undefined' ? localStorage.getItem('ai_claude_key') || '' : '';
+      }
+      return '';
+    };
+
+    const getApiHeader = (api: string, key: string): Record<string, string> => {
+      if (api === 'gemini') {
+        return { 'X-Gemini-Key': key };
+      } else if (api === 'claude') {
+        return { 'X-Claude-Key': key };
+      }
+      return {};
+    };
+
+    // 사용 가능한 API 목록에서 선택 (우선순위: Claude > Gemini > Geo-AIO)
+    let apiToUse = selectedApi;
+    let apiKey = getApiKey(apiToUse);
+
+    // 선택된 API 키가 없으면 다음 우선순위로
+    if (!apiKey) {
+      if (availableApis.includes('claude')) {
+        apiToUse = 'claude';
+        apiKey = getApiKey('claude');
+      } else if (availableApis.includes('gemini')) {
+        apiToUse = 'gemini';
+        apiKey = getApiKey('gemini');
+      }
+    }
+
+    if (!apiKey) {
+      setError('API 키가 설정되지 않았습니다. Gemini 또는 Claude API 키를 등록해주세요.');
+      setShowKeyRecovery(true);
+      return;
+    }
+
     setIsGenerating(true);
     setError(null);
+    setShowKeyRecovery(false);
 
     try {
-      // 사용량 체크
-      const usage = await canUseFeature('generate');
-      if (!usage.allowed) {
-        setError(`이번 달 콘텐츠 생성 사용 횟수(${usage.limit}회)를 모두 소진했습니다. 요금제를 업그레이드하세요.`);
-        setIsGenerating(false);
-        return;
+      // 사용량 체크 (커스텀 사용자 시스템: usage-summary API 사용)
+      if (currentUser) {
+        const usageRes = await fetch(`/api/usage-summary?user_id=${currentUser.id}`);
+        if (usageRes.ok) {
+          const usageData = await usageRes.json();
+          const genItem = usageData.summary?.find((s: { feature: string; remaining: number; limit: number }) => s.feature === 'generate');
+          if (genItem && genItem.limit !== -1 && genItem.remaining <= 0) {
+            setError(`이번 달 콘텐츠 생성 사용 횟수(${genItem.limit}회)를 모두 소진했습니다. 요금제를 업그레이드하세요.`);
+            setIsGenerating(false);
+            return;
+          }
+        }
       }
 
       saveBusinessInfo();
       const notes = buildAdditionalNotes();
 
-      if (abTestMode) {
-        // A/B 버전: 3가지 톤으로 동시 생성
-        const tones = [
-          { value: '전문적이고 신뢰감 있는', label: '전문적' },
-          { value: '친근하고 대화체의', label: '친근한' },
-          { value: '설득력 있고 강렬한', label: '설득적' },
-        ];
-        const results = await Promise.all(
-          tones.map(async (t) => {
-            const res = await fetch('/api/generate', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                category: selectedCategory,
-                topic: topic.trim(),
-                targetKeyword: targetKeyword.trim() || undefined,
-                tone: t.value,
-                additionalNotes: notes,
-              }),
-            });
-            if (!res.ok) throw new Error('생성 실패');
-            const data = await res.json();
-            return { ...data, toneName: t.label };
-          })
-        );
-        // A/B 결과를 localStorage에 저장하고 결과 페이지로
-        const now = new Date();
-        const dateStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')} ${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
-        // 각 버전을 이력에 저장
-        for (const r of results) {
-          const hid = generateId();
-          await saveHistoryItem({
-            id: hid, type: 'generation',
-            title: `[${r.toneName}] ${r.title || topic.trim()}`,
-            summary: `A/B 테스트 | ${r.toneName} 버전`,
-            date: dateStr, category: selectedCategory || undefined,
-            targetKeyword: targetKeyword.trim() || undefined,
-            generateResult: r, topic: topic.trim(), tone: r.toneName, revisions: [],
+      // 선택된 프로젝트의 업체 정보
+      let activeProjectInfo = selectedProject;
+      if (!activeProjectInfo) {
+        try {
+          const stored = sessionStorage.getItem('geoaio_project');
+          if (stored) activeProjectInfo = JSON.parse(stored);
+        } catch {}
+      }
+
+      // 10가지 톤으로 동시 생성
+      const results = await Promise.all(
+        toneOptions.map(async (t) => {
+          const res = await fetch('/api/generate', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...getApiHeader(apiToUse, apiKey),
+              'X-API-Provider': apiToUse,
+            },
+            body: JSON.stringify({
+              category: selectedCategory,
+              topic: topic.trim(),
+              targetKeyword: targetKeyword.trim() || undefined,
+              tone: t.value,
+              additionalNotes: notes,
+              company_name: activeProjectInfo?.company_name || undefined,
+              representative_name: activeProjectInfo?.representative_name || undefined,
+              region: activeProjectInfo?.region || undefined,
+            }),
           });
-        }
-        await incrementUsage('generate');
-        // 첫 번째 결과를 메인으로 저장
-        const { saveGenerateResult } = await import('@/lib/supabase-storage');
-        const mainResult = { ...results[0], abVersions: results };
-        const resultId = await saveGenerateResult({
-          result: mainResult, category: selectedCategory,
-          topic: topic.trim(), targetKeyword: targetKeyword.trim(),
-          tone: 'A/B 테스트', historyId: generateId(),
-        });
-        router.push(`/generate/result?id=${resultId}`);
-      } else {
-        // 일반 단일 생성
-        const response = await fetch('/api/generate', {
+          const data = await res.json();
+          if (!res.ok) throw new Error(`[${t.label}] ${data.error || `HTTP ${res.status}`}`);
+          return { ...data, toneName: t.label, toneValue: t.value };
+        })
+      );
+      // 사용량 기록 (커스텀 사용자 시스템)
+      if (currentUser) {
+        fetch('/api/usage-count', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            category: selectedCategory,
-            topic: topic.trim(),
-            targetKeyword: targetKeyword.trim() || undefined,
-            tone,
-            additionalNotes: notes,
-          }),
-        });
-
-        if (!response.ok) {
-          const err = await response.json();
-          throw new Error(err.error || '콘텐츠 생성에 실패했습니다.');
-        }
-
-        const data = await response.json();
-        await incrementUsage('generate');
-        const now = new Date();
-        const historyId = generateId();
-        await saveHistoryItem({
-          id: historyId, type: 'generation',
-          title: data.title || topic.trim(),
-          summary: `${categories.find(c => c.id === selectedCategory)?.label || ''} | ${topic.trim()}`,
-          date: `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')} ${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`,
-          category: selectedCategory || undefined,
-          targetKeyword: targetKeyword.trim() || undefined,
-          generateResult: data, topic: topic.trim(), tone, revisions: [],
-        });
-        const { saveGenerateResult } = await import('@/lib/supabase-storage');
-        const resultId = await saveGenerateResult({
-          result: data, category: selectedCategory,
-          topic: topic.trim(), targetKeyword: targetKeyword.trim(),
-          tone, historyId,
-        });
-        router.push(`/generate/result?id=${resultId}`);
+          body: JSON.stringify({ user_id: currentUser.id, feature: 'generate' }),
+        }).catch(() => {});
       }
+      const now = new Date();
+      const historyId = generateId();
+      const dateStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')} ${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+      await saveHistoryItem({
+        id: historyId, type: 'generation',
+        title: results[0].title || topic.trim(),
+        summary: `10가지 톤 버전 | ${topic.trim()}`,
+        date: dateStr, category: selectedCategory || undefined,
+        targetKeyword: targetKeyword.trim() || undefined,
+        generateResult: results[0], topic: topic.trim(), tone: '10가지 톤', revisions: [],
+      });
+      const { saveGenerateResult } = await import('@/lib/supabase-storage');
+      const mainResult = { ...results[0], abVersions: results };
+      const resultId = await saveGenerateResult({
+        result: mainResult, category: selectedCategory,
+        topic: topic.trim(), targetKeyword: targetKeyword.trim(),
+        tone: '10가지 톤', historyId,
+        project_id: selectedProject?.id,
+        selected_ab_index: 0,
+      });
+      router.push(`/generate/result?id=${resultId}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : '알 수 없는 오류가 발생했습니다.');
+      const msg = err instanceof Error ? err.message : '알 수 없는 오류가 발생했습니다.';
+      setError(msg);
+      // API 키 관련 오류면 복구 패널 표시
+      const isKeyError = msg.includes('API_KEY') || msg.includes('api key') || msg.includes('401')
+        || msg.includes('유효하지 않') || msg.includes('quota') || msg.includes('RESOURCE_EXHAUSTED')
+        || msg.includes('할당량') || msg.includes('키가 필요');
+      if (isKeyError) setShowKeyRecovery(true);
     } finally {
       setIsGenerating(false);
     }
   };
 
+  const handleSaveRecoveryKey = async (andRetry = false) => {
+    const key = recoveryKey.trim();
+    if (!key) return;
+    setRecoverySaving(true);
+    try {
+      localStorage.setItem('geoaio_gemini_key', key);
+      setContextApiKey(key);
+      await saveApiKey('gemini', key);
+      await fetch('/api/set-api-key', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ geminiApiKey: key }),
+      }).catch(() => {});
+      setRecoverySaved(true);
+      setRecoveryKey('');
+      setError(null);
+      if (andRetry) {
+        setShowKeyRecovery(false);
+        setRecoverySaved(false);
+        // 새 키가 context에 반영된 후 생성 재시도
+        setTimeout(() => handleGenerate(), 100);
+      }
+    } finally {
+      setRecoverySaving(false);
+    }
+  };
+
+  // 하단 패널 초기 키 상태 확인
+  useEffect(() => {
+    try {
+      if (localStorage.getItem('geoaio_gemini_key')) setInlineHasKey(true);
+    } catch {}
+    fetch('/api/set-api-key').then(r => r.json()).then(d => {
+      if (d.hasGeminiKey) setInlineHasKey(true);
+    }).catch(() => {});
+  }, []);
+
+  const handleSaveInlineKey = async (andGenerate = false) => {
+    const key = inlineKey.trim();
+    if (!key) return;
+    setInlineSaving(true);
+    setInlineStatus(null);
+    try {
+      localStorage.setItem('geoaio_gemini_key', key);
+      setContextApiKey(key);
+      await saveApiKey('gemini', key);
+      await fetch('/api/set-api-key', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ geminiApiKey: key }),
+      }).catch(() => {});
+      setInlineStatus({ type: 'success', msg: 'API 키가 저장되었습니다.' });
+      setInlineKey('');
+      setInlineHasKey(true);
+      setError(null);
+      setShowKeyRecovery(false);
+      if (andGenerate) setTimeout(() => handleGenerate(), 100);
+    } catch (e) {
+      setInlineStatus({ type: 'error', msg: e instanceof Error ? e.message : '저장 실패' });
+    } finally {
+      setInlineSaving(false);
+    }
+  };
+
+  const handleDeleteInlineKey = async () => {
+    try { localStorage.removeItem('geoaio_gemini_key'); } catch {}
+    setContextApiKey('');
+    const { deleteApiKey } = await import('@/lib/supabase-storage');
+    await deleteApiKey('gemini');
+    setInlineHasKey(false);
+    setInlineStatus({ type: 'success', msg: 'API 키가 삭제되었습니다.' });
+  };
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -466,6 +870,7 @@ export default function GeneratePage() {
         onToggleApiKey={() => setShowApiKeyInput(!showApiKeyInput)}
         apiKeyOpen={showApiKeyInput}
       />
+      <CategoryBanner />
 
       {/* API Key 입력 패널 */}
       <ApiKeyPanel visible={showApiKeyInput} />
@@ -862,6 +1267,37 @@ export default function GeneratePage() {
               )}
             </div>
 
+            {/* 선택된 프로젝트 표시 */}
+            {selectedProject ? (
+              <div className="flex items-center gap-3 px-4 py-3 bg-pink-50 border border-pink-200 rounded-xl">
+                <div className="w-7 h-7 bg-pink-500 rounded-lg flex items-center justify-center shrink-0">
+                  <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                  </svg>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs text-[#FF69B4] font-bold">선택된 프로젝트</p>
+                  <p className="text-[15px] font-semibold text-pink-900 truncate">{selectedProject.name}</p>
+                </div>
+                <Link href="/user-dashboard" className="text-xs text-pink-500 hover:text-pink-700 hover:underline shrink-0">변경</Link>
+              </div>
+            ) : (
+              <div className="flex items-center gap-3 px-4 py-3 bg-amber-50 border border-amber-200 rounded-xl">
+                <div className="w-7 h-7 bg-amber-400 rounded-lg flex items-center justify-center shrink-0">
+                  <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs text-amber-600 font-bold">프로젝트 미선택</p>
+                  <p className="text-[13px] text-amber-800">프로젝트를 선택하면 맞춤 콘텐츠를 생성할 수 있습니다</p>
+                </div>
+                <Link href="/user-dashboard" className="shrink-0 px-3 py-1.5 bg-amber-500 text-white text-xs font-semibold rounded-lg hover:bg-amber-600 transition-all">
+                  프로젝트 선택/추가
+                </Link>
+              </div>
+            )}
+
             {/* 카테고리 선택 */}
             <div className="bg-white rounded-xl shadow-sm border border-indigo-200 p-5">
               <h2 className="text-lg font-semibold text-gray-900 mb-1">콘텐츠 유형 선택</h2>
@@ -918,49 +1354,262 @@ export default function GeneratePage() {
                 <div className="space-y-3">
                   {/* 주제 */}
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">
-                      주제 <span className="text-red-500">*</span>
-                    </label>
+                    <div className="flex items-center justify-between mb-3">
+                      <label className="block text-sm font-medium text-gray-700">
+                        주제 <span className="text-red-500">*</span>
+                      </label>
+                      {selectedCategory && (
+                        <div className="flex flex-wrap gap-1.5 justify-end items-center">
+                          {loadingSubKeywords && (
+                            <span className="text-xs text-blue-500 flex items-center gap-1">
+                              <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                              분야 로딩 중...
+                            </span>
+                          )}
+                          {(dynamicSubKeywords.length > 0 ? dynamicSubKeywords : subKeywordsByCategory[selectedCategory] || []).map((kw) => (
+                            <button
+                              key={kw}
+                              onClick={() => setSelectedSubKeyword(selectedSubKeyword === kw ? '' : kw)}
+                              className={`px-2.5 py-1 text-xs font-semibold rounded-full transition-all ${
+                                selectedSubKeyword === kw
+                                  ? 'bg-blue-600 text-white shadow-sm'
+                                  : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                              }`}
+                            >
+                              {kw}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    {selectedSubKeyword && (
+                      <p className="text-xs text-blue-600 mb-2 font-medium">
+                        📌 선택됨: <strong>{selectedSubKeyword}</strong> (이것을 기반으로 주제가 추천됩니다)
+                      </p>
+                    )}
                     <input
                       type="text"
                       value={topic}
                       onChange={(e) => setTopic(e.target.value)}
+                      onBlur={(e) => { if (e.target.value.trim()) fetchKeywordSuggestions(e.target.value.trim()); }}
                       placeholder="예: 2024년 AI 마케팅 트렌드, 홈트레이닝 초보자 가이드"
                       className="w-full px-4 py-3 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent placeholder-gray-400"
                     />
+                    {/* AI 주제 추천 버튼 */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (showTopicDropdown) {
+                          setShowTopicDropdown(false);
+                        } else {
+                          setShowTopicDropdown(true);
+                          const currentTopic = topic.trim();
+                          if (selectedCategory && !loadingTopics) {
+                            // 주제가 입력된 경우: 항상 새로 추천 (입력 기반), 빈칸인 경우: 기존 방식
+                            if (currentTopic || topicSuggestions.length === 0) {
+                              fetchTopicSuggestions(selectedCategory, currentTopic || undefined);
+                            }
+                          }
+                        }
+                      }}
+                      className={`mt-1.5 flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-all ${
+                        showTopicDropdown
+                          ? selectedApi === 'claude'
+                            ? 'bg-slate-600 text-white border-slate-600'
+                            : 'bg-blue-600 text-white border-blue-600'
+                          : selectedApi === 'claude'
+                            ? 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
+                            : 'bg-white text-blue-600 border-blue-300 hover:bg-blue-50'
+                      }`}
+                    >
+                      {loadingTopics
+                        ? <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                        : <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
+                      }
+                      {loadingTopics
+                        ? 'AI 주제 생성 중...'
+                        : showTopicDropdown
+                          ? '주제 추천 닫기'
+                          : `✨ ${selectedApi === 'claude' ? '🧠 Claude' : '🌐 Gemini'}로 주제 추천받기`
+                      }
+                    </button>
+
+                    {/* 추천 주제 패널 (일반 흐름, absolute 아님) */}
+                    {showTopicDropdown && (
+                      <div className="mt-1 bg-white border border-blue-200 rounded-xl shadow-sm overflow-hidden">
+                        {loadingTopics ? (
+                          <div className="p-3 space-y-2">
+                            {[1,2,3,4,5].map(i => <div key={i} className="h-8 bg-gray-100 rounded animate-pulse" />)}
+                            <p className="text-xs text-center text-gray-400">AI가 주제를 생성하는 중...</p>
+                          </div>
+                        ) : topicFetchError ? (
+                          <div className="p-3 text-center space-y-2">
+                            <p className="text-xs text-red-500">{topicFetchError}</p>
+                            <button type="button" onClick={() => selectedCategory && fetchTopicSuggestions(selectedCategory, topic.trim() || undefined)}
+                              className="text-xs text-blue-500 hover:underline">다시 시도</button>
+                          </div>
+                        ) : topicSuggestions.length === 0 ? (
+                          <div className="p-3 text-center space-y-2">
+                            <p className="text-xs text-gray-400">AI가 주제를 불러오고 있습니다...</p>
+                          </div>
+                        ) : (
+                          <ul className="py-1">
+                            <li className={`px-3 py-1.5 text-xs font-semibold border-b flex items-center justify-between ${
+                              selectedApi === 'claude'
+                                ? 'text-slate-600 bg-slate-50 border-slate-100'
+                                : 'text-blue-500 bg-blue-50 border-blue-100'
+                            }`}>
+                              <span>✨ {selectedApi === 'claude' ? '🧠 Claude' : '🌐 Gemini'} 추천 주제 (클릭하면 입력됩니다)</span>
+                              <button type="button" onClick={() => selectedCategory && fetchTopicSuggestions(selectedCategory, topic.trim() || undefined)}
+                                className={`transition-colors text-base ${
+                                  selectedApi === 'claude'
+                                    ? 'text-slate-400 hover:text-slate-600'
+                                    : 'text-blue-400 hover:text-blue-600'
+                                }`} title="새로 추천">↺</button>
+                            </li>
+                            {topicSuggestions.map((s, i) => (
+                              <li key={i}>
+                                <button
+                                  type="button"
+                                  onClick={() => handleTopicSuggestionClick(s)}
+                                  className="w-full text-left px-3 py-2.5 text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-700 transition-colors border-b border-gray-50 last:border-0"
+                                >
+                                  {s}
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   {/* 타겟 키워드 */}
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">타겟 키워드 (선택)</label>
-                    <input
-                      type="text"
-                      value={targetKeyword}
-                      onChange={(e) => setTargetKeyword(e.target.value)}
-                      placeholder="예: AI 마케팅, 홈트레이닝"
-                      className="w-full px-4 py-3 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent placeholder-gray-400"
-                    />
+
+                    {/* 선택된 키워드 칩 + 입력창 */}
+                    <div className={`flex flex-wrap gap-1.5 px-3 py-2 border border-gray-200 rounded-xl bg-white focus-within:ring-2 focus-within:ring-blue-400 focus-within:border-transparent min-h-[48px] items-center ${loadingKeywords ? 'bg-gray-50' : ''}`}>
+                      {loadingKeywords && (
+                        <span className="text-xs text-indigo-500 flex items-center gap-1">
+                          <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                          키워드 추천 중...
+                        </span>
+                      )}
+                      {selectedKeywords.map((kw, i) => (
+                        <span key={i} className="inline-flex items-center gap-1 px-2.5 py-1 bg-indigo-600 text-white text-xs rounded-full">
+                          {kw}
+                          <button type="button"
+                            onClick={() => { setSelectedKeywords(p => { const n = p.filter(k => k !== kw); setTargetKeyword(n.join(', ')); return n; }); }}
+                            className="hover:text-indigo-200 ml-0.5 leading-none font-bold">×</button>
+                        </span>
+                      ))}
+                      <input
+                        type="text"
+                        value={customKeyword}
+                        onChange={(e) => setCustomKeyword(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustomKeyword(); } }}
+                        placeholder={selectedKeywords.length === 0 && !loadingKeywords ? '키워드 직접 입력 후 Enter' : ''}
+                        className="flex-1 min-w-[120px] text-sm outline-none bg-transparent placeholder-gray-400 py-1"
+                      />
+                    </div>
+
+                    {/* AI 추천 키워드 */}
+                    {keywordSuggestions.length > 0 && !loadingKeywords && (
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        <span className="text-xs text-gray-400 self-center">추천:</span>
+                        {keywordSuggestions.map((kw, i) => (
+                          <button
+                            key={i}
+                            type="button"
+                            onClick={() => toggleKeyword(kw)}
+                            className={`px-2.5 py-1 text-xs rounded-full border transition-all ${
+                              selectedKeywords.includes(kw)
+                                ? 'bg-indigo-100 text-indigo-600 border-indigo-300 line-through opacity-50'
+                                : 'bg-gray-50 text-gray-600 border-gray-300 hover:border-indigo-400 hover:text-indigo-600'
+                            }`}
+                          >
+                            + {kw}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
 
-                  {/* 톤/스타일 */}
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">톤/스타일</label>
-                    <div className="flex flex-wrap gap-2">
-                      {toneOptions.map((opt) => (
-                        <button
-                          key={opt.value}
-                          onClick={() => setTone(opt.value)}
-                          className={`px-4 py-2 text-sm rounded-xl border transition-all ${
-                            tone === opt.value
-                              ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white border-sky-300'
-                              : 'bg-gray-50 text-gray-600 border-gray-200 hover:border-indigo-300'
-                          }`}
-                        >
-                          {opt.label}
-                        </button>
-                      ))}
+                  {/* 톤/스타일 - 10가지 모두 자동 생성 */}
+                  {(() => {
+                    const TONE_STYLES = [
+                      { bg: 'bg-indigo-50', border: 'border-indigo-300', text: 'text-indigo-700', dot: 'bg-indigo-400' },
+                      { bg: 'bg-emerald-50', border: 'border-emerald-300', text: 'text-emerald-700', dot: 'bg-emerald-400' },
+                      { bg: 'bg-rose-50', border: 'border-rose-300', text: 'text-rose-700', dot: 'bg-rose-400' },
+                      { bg: 'bg-amber-50', border: 'border-amber-300', text: 'text-amber-700', dot: 'bg-amber-400' },
+                      { bg: 'bg-violet-50', border: 'border-violet-300', text: 'text-violet-700', dot: 'bg-violet-400' },
+                      { bg: 'bg-sky-50', border: 'border-sky-300', text: 'text-sky-700', dot: 'bg-sky-400' },
+                      { bg: 'bg-teal-50', border: 'border-teal-300', text: 'text-teal-700', dot: 'bg-teal-400' },
+                      { bg: 'bg-orange-50', border: 'border-orange-300', text: 'text-orange-700', dot: 'bg-orange-400' },
+                      { bg: 'bg-cyan-50', border: 'border-cyan-300', text: 'text-cyan-700', dot: 'bg-cyan-400' },
+                      { bg: 'bg-pink-50', border: 'border-pink-300', text: 'text-pink-700', dot: 'bg-pink-400' },
+                    ];
+                    return (
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                          톤/스타일
+                          <span className="text-xs text-indigo-500 font-normal ml-1.5">(10가지 버전 동시 생성)</span>
+                        </label>
+                        <div className="flex flex-wrap gap-2">
+                          {toneOptions.map((opt, i) => {
+                            const s = TONE_STYLES[i % TONE_STYLES.length];
+                            return (
+                              <span key={opt.value}
+                                className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl border ${s.bg} ${s.border} ${s.text}`}>
+                                <span className={`w-1.5 h-1.5 rounded-full ${s.dot}`} />
+                                {opt.label}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* AI API 상태 표시 */}
+                  {availableApis.length > 0 && (
+                    <div className="bg-gradient-to-r from-emerald-50 to-teal-50 rounded-xl p-4 border border-emerald-200">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-sm font-semibold text-gray-900">🤖 사용 가능한 AI</span>
+                        <span className="text-xs font-bold text-emerald-600">{availableApis.length}개 활성</span>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {availableApis.includes('gemini') && (
+                          <button
+                            onClick={() => setSelectedApi('gemini')}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                              selectedApi === 'gemini'
+                                ? 'bg-blue-500 text-white shadow-sm'
+                                : 'bg-blue-100 text-blue-700 hover:bg-blue-200'
+                            }`}
+                          >
+                            🌐 Gemini
+                          </button>
+                        )}
+                        {availableApis.includes('claude') && (
+                          <button
+                            onClick={() => setSelectedApi('claude')}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                              selectedApi === 'claude'
+                                ? 'bg-slate-600 text-white shadow-sm'
+                                : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                            }`}
+                          >
+                            🧠 Claude
+                          </button>
+                        )}
+                      </div>
+                      <p className="text-xs text-gray-600 mt-2">
+                        💡 선택한 AI로 생성합니다. 실패 시 다른 AI로 자동 재시도됩니다.
+                      </p>
                     </div>
-                  </div>
+                  )}
 
                   {/* 추가 요구사항 + 참조 파일 업로드 */}
                   <div>
@@ -1057,23 +1706,6 @@ export default function GeneratePage() {
                     )}
                   </div>
 
-                  {/* A/B 테스트 모드 */}
-                  <div className="flex items-center gap-3 p-3 bg-gradient-to-r from-orange-50 to-amber-50 rounded-xl border border-amber-200">
-                    <label className="relative inline-flex items-center cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={abTestMode}
-                        onChange={(e) => setAbTestMode(e.target.checked)}
-                        className="sr-only peer"
-                      />
-                      <div className="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-amber-500"></div>
-                    </label>
-                    <div>
-                      <p className="text-sm font-semibold text-amber-800">A/B 버전 생성</p>
-                      <p className="text-[10px] text-amber-600">전문적 / 친근한 / 설득적 3가지 톤으로 동시 생성하여 비교</p>
-                    </div>
-                  </div>
-
                   {/* 생성 버튼 */}
                   <button
                     onClick={handleGenerate}
@@ -1086,7 +1718,7 @@ export default function GeneratePage() {
                           <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                         </svg>
-                        AI 콘텐츠 생성 중...
+                        10가지 톤 콘텐츠 생성 중...
                       </>
                     ) : (
                       <>
@@ -1097,6 +1729,99 @@ export default function GeneratePage() {
                       </>
                     )}
                   </button>
+
+                  {/* ── 상시 API 키 설정 카드 ── */}
+                  <div className="rounded-2xl border border-gray-200 overflow-hidden shadow-sm">
+                    {/* 헤더 */}
+                    <div className="flex items-center gap-3 px-5 py-4 bg-gradient-to-r from-blue-500 to-indigo-600">
+                      <div className="w-9 h-9 bg-white/20 rounded-xl flex items-center justify-center shrink-0">
+                        <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+                        </svg>
+                      </div>
+                      <div className="flex-1">
+                        <p className="text-white font-bold text-sm">API 키 설정</p>
+                        <p className="text-blue-100 text-xs">Google Gemini API 키를 등록하세요</p>
+                      </div>
+                      {inlineHasKey && (
+                        <span className="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-400 text-white shrink-0">
+                          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>
+                          등록됨
+                        </span>
+                      )}
+                    </div>
+
+                    {/* 본문 */}
+                    <div className="px-5 py-4 space-y-3 bg-white">
+                      {/* 안내 박스 */}
+                      <div className="bg-blue-50 border border-blue-100 rounded-xl px-4 py-3">
+                        <p className="text-xs font-bold text-blue-800 mb-1">Gemini API 키란?</p>
+                        <p className="text-xs text-blue-700 leading-relaxed">
+                          Google AI Studio에서 무료로 발급받을 수 있는 키입니다. 등록하면 AI 주제 추천, 키워드 제안, 콘텐츠 생성 기능을 사용할 수 있습니다.
+                        </p>
+                      </div>
+
+                      {/* 입력 */}
+                      <div>
+                        <label className="block text-xs font-medium text-gray-600 mb-1.5">
+                          API 키 입력
+                          {inlineHasKey && <span className="text-gray-400 font-normal ml-1">(새 키 입력 시 기존 키 교체)</span>}
+                        </label>
+                        <div className="flex gap-2">
+                          <div className="relative flex-1">
+                            <input
+                              type={inlineKeyVisible ? 'text' : 'password'}
+                              value={inlineKey}
+                              onChange={e => { setInlineKey(e.target.value); setInlineStatus(null); }}
+                              onKeyDown={e => e.key === 'Enter' && handleSaveInlineKey(false)}
+                              placeholder={inlineHasKey ? '새 키를 입력하면 기존 키가 교체됩니다' : 'AIza... 로 시작하는 Gemini API 키'}
+                              className="w-full pl-4 pr-10 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent placeholder-gray-300 font-mono bg-gray-50"
+                            />
+                            <button type="button" onClick={() => setInlineKeyVisible(v => !v)}
+                              className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+                              {inlineKeyVisible
+                                ? <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg>
+                                : <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                              }
+                            </button>
+                          </div>
+                          <button
+                            onClick={() => handleSaveInlineKey(false)}
+                            disabled={inlineSaving || !inlineKey.trim()}
+                            className="px-5 py-2.5 bg-blue-600 text-white text-sm font-semibold rounded-xl hover:bg-blue-700 transition-all disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap"
+                          >
+                            {inlineSaving ? '저장 중...' : '저장'}
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* 상태 메시지 */}
+                      {inlineStatus && (
+                        <p className={`text-xs font-medium ${inlineStatus.type === 'success' ? 'text-emerald-600' : 'text-red-600'}`}>
+                          {inlineStatus.type === 'success' ? '✓ ' : '✗ '}{inlineStatus.msg}
+                        </p>
+                      )}
+
+                      {/* 하단 링크 행 */}
+                      <div className="flex items-center justify-between pt-1">
+                        {inlineHasKey ? (
+                          <button onClick={handleDeleteInlineKey}
+                            className="text-xs text-red-500 hover:text-red-700 hover:underline transition-all">
+                            등록된 키 삭제
+                          </button>
+                        ) : <span />}
+                        <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 hover:underline transition-all">
+                          키 무료 발급받기
+                          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                          </svg>
+                        </a>
+                      </div>
+                    </div>
+                  </div>
+                  {/* ── /상시 API 키 설정 카드 ── */}
+
                 </div>
               </div>
             )}
@@ -1104,15 +1829,105 @@ export default function GeneratePage() {
             {/* 에러 */}
             {error && (
               <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex items-start gap-3">
-                <svg className="w-5 h-5 text-red-500 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <svg className="w-5 h-5 text-red-500 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                <div>
+                <div className="flex-1">
                   <p className="text-sm text-red-700">{error}</p>
                   {error.includes('소진했습니다') && (
                     <Link href="/pricing" className="inline-block mt-2 text-sm font-semibold text-indigo-600 hover:text-indigo-800 underline">
                       요금제 확인하기 &rarr;
                     </Link>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* API 키 에러 복구 패널 */}
+            {showKeyRecovery && (
+              <div className="rounded-2xl border-2 border-amber-300 bg-gradient-to-br from-amber-50 to-orange-50 overflow-hidden shadow-md">
+                {/* 헤더 */}
+                <div className="flex items-center gap-3 px-5 py-3.5 bg-amber-500">
+                  <div className="w-8 h-8 bg-white/20 rounded-lg flex items-center justify-center shrink-0">
+                    <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+                    </svg>
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-sm font-bold text-white">API 키를 재입력하고 바로 재시도하세요</p>
+                    <p className="text-xs text-amber-100">새 키를 저장하면 이 페이지를 벗어나지 않고 즉시 생성을 재시작합니다</p>
+                  </div>
+                  <button onClick={() => setShowKeyRecovery(false)} className="w-6 h-6 flex items-center justify-center rounded-md bg-white/15 hover:bg-white/30 text-white transition-all">
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                  </button>
+                </div>
+
+                {/* 본문 */}
+                <div className="px-5 py-4 space-y-3">
+                  {/* 안내 링크 */}
+                  <div className="flex items-center gap-2 text-xs text-amber-800 bg-amber-100 border border-amber-200 rounded-lg px-3 py-2">
+                    <svg className="w-4 h-4 shrink-0 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <span>API 키가 없으신가요?</span>
+                    <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer"
+                      className="font-semibold text-amber-700 hover:text-amber-900 underline underline-offset-2">
+                      Google AI Studio에서 무료 발급 →
+                    </a>
+                  </div>
+
+                  {/* 입력 */}
+                  <div className="flex gap-2">
+                    <div className="relative flex-1">
+                      <input
+                        type={recoveryKeyVisible ? 'text' : 'password'}
+                        value={recoveryKey}
+                        onChange={e => { setRecoveryKey(e.target.value); setRecoverySaved(false); }}
+                        onKeyDown={e => e.key === 'Enter' && handleSaveRecoveryKey(false)}
+                        placeholder="AIza... 로 시작하는 Gemini API 키 입력"
+                        className="w-full pl-4 pr-10 py-2.5 border-2 border-amber-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-400 focus:border-transparent font-mono bg-white placeholder-gray-400"
+                      />
+                      <button type="button" onClick={() => setRecoveryKeyVisible(v => !v)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+                        {recoveryKeyVisible
+                          ? <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg>
+                          : <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                        }
+                      </button>
+                    </div>
+                    {/* 저장만 */}
+                    <button
+                      onClick={() => handleSaveRecoveryKey(false)}
+                      disabled={recoverySaving || !recoveryKey.trim()}
+                      className="px-4 py-2.5 bg-white border-2 border-amber-300 text-amber-700 text-sm font-semibold rounded-xl hover:bg-amber-50 transition-all disabled:opacity-40 whitespace-nowrap"
+                    >
+                      {recoverySaved ? '✓ 저장됨' : '저장'}
+                    </button>
+                    {/* 저장 후 바로 재시도 */}
+                    <button
+                      onClick={() => handleSaveRecoveryKey(true)}
+                      disabled={recoverySaving || !recoveryKey.trim()}
+                      className="px-4 py-2.5 bg-amber-500 text-white text-sm font-bold rounded-xl hover:bg-amber-600 transition-all disabled:opacity-40 whitespace-nowrap flex items-center gap-1.5 shadow-md"
+                    >
+                      {recoverySaving ? (
+                        <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                        </svg>
+                      ) : (
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                        </svg>
+                      )}
+                      저장 후 재시도
+                    </button>
+                  </div>
+
+                  {recoverySaved && !recoverySaving && (
+                    <p className="text-xs text-emerald-700 font-medium flex items-center gap-1">
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                      키가 저장되었습니다. 생성 버튼을 눌러 다시 시도하세요.
+                    </p>
                   )}
                 </div>
               </div>
@@ -1159,6 +1974,116 @@ export default function GeneratePage() {
             )}
           </>
         )}
+
+        {/* Claude API 키 설정 섹션 - 페이지 하단 */}
+        <div className="mt-12 max-w-2xl mx-auto bg-gradient-to-br from-slate-50 to-slate-100 rounded-2xl border border-slate-200 p-8 shadow-sm">
+          <div className="flex items-start gap-3 mb-4">
+            <div className="w-10 h-10 bg-gradient-to-br from-slate-400 to-slate-500 rounded-lg flex items-center justify-center flex-shrink-0">
+              <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+              </svg>
+            </div>
+            <div className="flex-1">
+              <h3 className="text-lg font-bold text-slate-900">🔐 Claude API 키 설정</h3>
+              <p className="text-sm text-slate-600 mt-1">
+                생성 실패 시 Claude API 키를 등록하여 추가 AI 모델을 사용하세요
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            {/* Claude API 키 입력 */}
+            <div>
+              <label className="block text-sm font-semibold text-slate-700 mb-2">
+                Anthropic Claude API 키
+              </label>
+              <div className="flex gap-2">
+                <div className="flex-1 relative">
+                  <input
+                    type="password"
+                    id="claudeKeyInput"
+                    placeholder="sk-ant-... (Claude API 키)"
+                    className="w-full px-4 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-slate-400 focus:border-transparent font-mono bg-white placeholder-slate-400"
+                  />
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      const input = (e.currentTarget.previousElementSibling as HTMLInputElement);
+                      input.type = input.type === 'password' ? 'text' : 'password';
+                    }}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                    </svg>
+                  </button>
+                </div>
+                <a
+                  href="https://console.anthropic.com/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-4 py-2.5 text-sm font-semibold text-white bg-gradient-to-r from-slate-600 to-slate-700 border border-slate-700 rounded-xl hover:from-slate-700 hover:to-slate-800 transition-all whitespace-nowrap"
+                >
+                  발급받기
+                </a>
+              </div>
+              <p className="text-xs text-slate-500 mt-1.5">
+                ℹ️ <a href="https://console.anthropic.com/" target="_blank" rel="noopener noreferrer" className="underline hover:text-slate-700">Anthropic Console</a>에서 API 키를 발급받은 후 등록하세요
+              </p>
+            </div>
+
+            {/* 저장 및 삭제 버튼 */}
+            <div className="flex gap-2 pt-2">
+              <button
+                onClick={() => {
+                  const keyInput = document.getElementById('claudeKeyInput') as HTMLInputElement;
+                  if (keyInput?.value.trim()) {
+                    localStorage.setItem('ai_claude_key', keyInput.value.trim());
+                    alert('✅ Claude API 키가 저장되었습니다');
+                    keyInput.value = '';
+                  } else {
+                    alert('❌ API 키를 입력해주세요');
+                  }
+                }}
+                className="px-5 py-2.5 bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-semibold rounded-xl transition-all"
+              >
+                💾 저장
+              </button>
+              <button
+                onClick={() => {
+                  if (confirm('저장된 Claude API 키를 삭제하시겠습니까?')) {
+                    localStorage.removeItem('ai_claude_key');
+                    alert('✅ Claude API 키가 삭제되었습니다');
+                  }
+                }}
+                className="px-5 py-2.5 bg-red-500 hover:bg-red-600 text-white text-sm font-semibold rounded-xl transition-all"
+              >
+                🗑️ 삭제
+              </button>
+              <button
+                onClick={() => {
+                  const storedKey = localStorage.getItem('ai_claude_key');
+                  if (storedKey) {
+                    alert('✅ Claude API 키가 저장되어 있습니다');
+                  } else {
+                    alert('❌ 저장된 Claude API 키가 없습니다');
+                  }
+                }}
+                className="ml-auto px-5 py-2.5 bg-slate-500 hover:bg-slate-600 text-white text-sm font-semibold rounded-xl transition-all"
+              >
+                ✓ 상태 확인
+              </button>
+            </div>
+          </div>
+
+          {/* 안내 박스 */}
+          <div className="mt-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+            <p className="text-xs text-blue-800 leading-relaxed">
+              💡 <strong>Claude API 사용:</strong> 생성 과정에서 Gemini 또는 다른 API가 실패할 경우 저장된 Claude API 키를 사용하여 자동으로 재시도합니다.
+            </p>
+          </div>
+        </div>
 
       </main>
 
